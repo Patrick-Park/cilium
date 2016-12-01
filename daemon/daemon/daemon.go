@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cilium/cilium/bpf/lbmap"
 	"github.com/cilium/cilium/bpf/lxcmap"
@@ -156,6 +157,29 @@ func (d *Daemon) compileBase() error {
 	return nil
 }
 
+func (d *Daemon) registerNodeAddress() error {
+	if !d.conf.IPv4Enabled {
+		return nil
+	}
+	var err error
+	ipv6NodeAddress := d.conf.NodeAddress.IPv6Address.NodeIP().String()
+	nodeIPv4Prefix, _, err := d.PutNodeAddr(ipv6NodeAddress)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			d.DeleteNodeIPv4PrefixByNodeAddr(ipv6NodeAddress)
+		}
+	}()
+	nodeAddr, err := addressing.NewNodeAddress(ipv6NodeAddress, nodeIPv4Prefix.IPv4, "")
+	if err != nil {
+		return err
+	}
+	d.conf.NodeAddress = nodeAddr
+	return nil
+}
+
 func (d *Daemon) init() error {
 	globalsDir := filepath.Join(d.conf.RunDir, "globals")
 	if err := os.MkdirAll(globalsDir, 0755); err != nil {
@@ -258,11 +282,7 @@ func (d *Daemon) init() error {
 	return nil
 }
 
-// NewDaemon creates and returns a new Daemon with the parameters set in c.
-func NewDaemon(c *Config) (*Daemon, error) {
-	if c == nil {
-		return nil, fmt.Errorf("Configuration is nil")
-	}
+func (c *Config) createIPAMConf() (*ipam.IPAMConfig, error) {
 
 	ipamSubnets := net.IPNet{
 		IP:   c.NodeAddress.IPv6Address.IP(),
@@ -309,6 +329,15 @@ func NewDaemon(c *Config) (*Daemon, error) {
 
 	}
 
+	return ipamConf, nil
+}
+
+// NewDaemon creates and returns a new Daemon with the parameters set in c.
+func NewDaemon(c *Config) (*Daemon, error) {
+	if c == nil {
+		return nil, fmt.Errorf("Configuration is nil")
+	}
+
 	var kvClient kvstore.KVClient
 
 	if c.ConsulConfig != nil {
@@ -342,7 +371,6 @@ func NewDaemon(c *Config) (*Daemon, error) {
 
 	d := Daemon{
 		conf:                      c,
-		ipamConf:                  ipamConf,
 		kvClient:                  kvClient,
 		dockerClient:              dockerClient,
 		containers:                make(map[string]*types.Container),
@@ -367,8 +395,38 @@ func NewDaemon(c *Config) (*Daemon, error) {
 		}
 	}
 
-	if err := d.init(); err != nil {
-		log.Fatalf("Error while initializing daemon: %s\n", err)
+	if d.conf.KVStoreIPv4Registration {
+		// Register IPv4 prefix in KVStore
+		if err := d.registerNodeAddress(); err != nil {
+			return nil, err
+		}
+		go func() {
+			for {
+				// Register IPv4 prefix forever every 10 minutes...
+				ipv6NodeAddress := d.conf.NodeAddress.IPv6Address.NodeIP().String()
+				_, _, err := d.PutNodeAddr(ipv6NodeAddress)
+				if err != nil {
+					log.Errorf("Unable to refresh node address in the KVStore: %s", err)
+				}
+				time.Sleep(10 * time.Minute)
+			}
+		}()
+	}
+	ipv6NodeAddress := d.conf.NodeAddress.IPv6Address.NodeIP().String()
+	defer func(ipv6NodeAddress string) {
+		if err != nil {
+			d.DeleteNodeIPv4PrefixByNodeAddr(ipv6NodeAddress)
+		}
+	}(ipv6NodeAddress)
+
+	// Set up ipam conf after init() because we might be running d.conf.KVStoreIPv4Registration
+	if d.ipamConf, err = d.conf.createIPAMConf(); err != nil {
+		return nil, err
+	}
+
+	if err = d.init(); err != nil {
+		log.Errorf("Error while initializing daemon: %s\n", err)
+		return nil, err
 	}
 
 	if d.conf.IsUIEnabled() {

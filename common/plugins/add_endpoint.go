@@ -80,6 +80,15 @@ func SetupVeth(id string, mtu int, ep *endpoint.Endpoint) (*netlink.Veth, *netli
 			lxcIfName, err)
 	}
 
+	// Enable optimistic DAD on container facing veth peer
+	// net.ipv6.conf.$VETH.optimistic_dad=1
+	args = []string{"-w", "net.ipv6.conf." + tmpIfName + ".optimistic_dad=1"}
+	_, err = exec.Command("sysctl", args...).CombinedOutput()
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("unable to enable optimistic DAD on %s: %s",
+			tmpIfName, err)
+	}
+
 	peer, err := netlink.LinkByName(tmpIfName)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("unable to lookup veth peer just created: %s", err)

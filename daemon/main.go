@@ -348,6 +348,7 @@ func configDaemon(ctx *cli.Context) {
 }
 
 func initEnv(ctx *cli.Context) error {
+
 	config.OptsMU.Lock()
 	if ctx.GlobalBool("debug") {
 		common.SetupLOG(log, "DEBUG")
